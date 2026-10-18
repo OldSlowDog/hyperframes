@@ -241,55 +241,57 @@ export async function runPolicies(args: PoliciesArgs): Promise<void> {
       console.log(JSON.stringify(wrapped, null, 2));
       return;
     }
-    case "validate": {
-      if (!args.inputPath) {
-        const msg =
-          "[lambda policies validate] usage: hyperframes lambda policies validate <policy.json>";
-        if (args.json) {
-          console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
-          setCommandExitCode(1);
-          return;
-        }
-        throw new Error(msg);
-      }
-      let result: ValidateResult;
-      try {
-        result = validatePolicy(args.inputPath);
-      } catch (err) {
-        const msg = normalizeErrorMessage(err);
-        if (args.json) {
-          console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
-          setCommandExitCode(1);
-          return;
-        }
-        console.error(c.error(`Failed to validate ${args.inputPath}: ${msg}`));
-        setCommandExitCode(1);
-        return;
-      }
-      if (args.json) {
-        console.log(JSON.stringify({ ok: result.missing.length === 0, ...result }, null, 2));
-        if (result.missing.length > 0) setCommandExitCode(1);
-        return;
-      }
-      for (const warning of result.warnings) {
-        console.warn(c.dim(`Warning: ${warning}`));
-      }
-      if (result.missing.length === 0) {
-        console.log(c.success(`Policy covers all ${result.required.length} required actions.`));
-        return;
-      }
-      console.log(c.error(`Policy is missing ${result.missing.length} required action(s):`));
-      for (const action of result.missing) {
-        console.log(`  • ${action}`);
-      }
-      console.log();
-      console.log(
-        c.dim("Run `hyperframes lambda policies user` to print the full required policy."),
-      );
-      setCommandExitCode(1);
-      return;
-    }
+    case "validate":
+      return runPolicyValidation(args);
   }
+}
+
+function runPolicyValidation(args: PoliciesArgs): void {
+  if (!args.inputPath) return missingPolicyPath(args.json);
+  let result: ValidateResult;
+  try {
+    result = validatePolicy(args.inputPath);
+  } catch (err) {
+    return invalidPolicyInput(args, normalizeErrorMessage(err));
+  }
+  if (args.json) return printPolicyValidationJson(result);
+  printPolicyValidation(result);
+}
+
+function missingPolicyPath(json: boolean): void {
+  const msg =
+    "[lambda policies validate] usage: hyperframes lambda policies validate <policy.json>";
+  if (!json) throw new Error(msg);
+  console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+  setCommandExitCode(1);
+}
+
+function invalidPolicyInput(args: PoliciesArgs, msg: string): void {
+  if (args.json) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+  else console.error(c.error(`Failed to validate ${args.inputPath}: ${msg}`));
+  setCommandExitCode(1);
+}
+
+function printPolicyValidationJson(result: ValidateResult): void {
+  console.log(JSON.stringify({ ok: result.missing.length === 0, ...result }, null, 2));
+  if (result.missing.length > 0) setCommandExitCode(1);
+}
+
+function printPolicyValidation(result: ValidateResult): void {
+  for (const warning of result.warnings) {
+    console.warn(c.dim(`Warning: ${warning}`));
+  }
+  if (result.missing.length === 0) {
+    console.log(c.success(`Policy covers all ${result.required.length} required actions.`));
+    return;
+  }
+  console.log(c.error(`Policy is missing ${result.missing.length} required action(s):`));
+  for (const action of result.missing) {
+    console.log(`  • ${action}`);
+  }
+  console.log();
+  console.log(c.dim("Run `hyperframes lambda policies user` to print the full required policy."));
+  setCommandExitCode(1);
 }
 
 export interface ValidateResult {
@@ -342,28 +344,8 @@ export function validatePolicy(policyPath: string): ValidateResult {
         ]
       : [];
 
-  const grantedPatterns: string[] = [];
   const warnings: string[] = [];
-  for (const stmt of statements) {
-    if (stmt.Effect !== "Allow") continue;
-    if (stmt.NotAction !== undefined) {
-      warnings.push(
-        "Allow statement uses NotAction; the validator only checks positive Action grants, so this statement is being ignored. Convert to an explicit Action list to validate it.",
-      );
-      continue;
-    }
-    if (stmt.NotResource !== undefined) {
-      warnings.push(
-        "Allow statement uses NotResource; resource-scoping is not modelled by this validator. Treating the statement as fully granted on its Action set.",
-      );
-    }
-    const actions = stmt.Action;
-    if (typeof actions === "string") {
-      grantedPatterns.push(actions);
-    } else if (Array.isArray(actions)) {
-      for (const a of actions) if (typeof a === "string") grantedPatterns.push(a);
-    }
-  }
+  const grantedPatterns = grantedPolicyPatterns(statements, warnings);
 
   for (const pattern of grantedPatterns) {
     if (hasMidStringWildcard(pattern)) {
@@ -384,6 +366,39 @@ export function validatePolicy(policyPath: string): ValidateResult {
     }
   }
   return { required, granted, missing, warnings };
+}
+
+type ParsedPolicyStatement = {
+  Effect?: string;
+  Action?: unknown;
+  NotAction?: unknown;
+  NotResource?: unknown;
+};
+
+function grantedPolicyPatterns(statements: ParsedPolicyStatement[], warnings: string[]): string[] {
+  return statements.flatMap((stmt) => grantedStatementPatterns(stmt, warnings));
+}
+
+function grantedStatementPatterns(stmt: ParsedPolicyStatement, warnings: string[]): string[] {
+  if (stmt.Effect !== "Allow") return [];
+  if (stmt.NotAction !== undefined) {
+    warnings.push(
+      "Allow statement uses NotAction; the validator only checks positive Action grants, so this statement is being ignored. Convert to an explicit Action list to validate it.",
+    );
+    return [];
+  }
+  if (stmt.NotResource !== undefined) {
+    warnings.push(
+      "Allow statement uses NotResource; resource-scoping is not modelled by this validator. Treating the statement as fully granted on its Action set.",
+    );
+  }
+  return policyActionPatterns(stmt.Action);
+}
+
+function policyActionPatterns(actions: unknown): string[] {
+  if (typeof actions === "string") return [actions];
+  if (!Array.isArray(actions)) return [];
+  return actions.filter((action): action is string => typeof action === "string");
 }
 
 function hasMidStringWildcard(pattern: string): boolean {
